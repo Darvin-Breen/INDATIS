@@ -1,0 +1,438 @@
+#!/usr/bin/env python3
+"""
+ESG Report Clustering with K-MEANS + LED Summarization
+Combines LED for long document summarization with K-means clustering
+"""
+
+import os
+import glob
+import pandas as pd
+import numpy as np
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from sentence_transformers import SentenceTransformer
+from sklearn.cluster import KMeans
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
+from sklearn.metrics import silhouette_score
+import warnings
+warnings.filterwarnings('ignore')
+import torch
+
+# ============================================
+# CONFIGURATION
+# ============================================
+SUMMARIZATION_MODEL = "pszemraj/led-base-book-summary"
+SUMMARIZATION_MODEL_LINK = "https://huggingface.co/pszemraj/led-base-book-summary"
+EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+EMBEDDING_MODEL_LINK = "https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+
+MAX_INPUT_TOKENS = 16000
+CHUNK_OVERLAP = 200
+
+# ============================================
+# STEP 1: LOAD TEXT FILES
+# ============================================
+def load_text_files(data_folder="data"):
+    """Load all .txt files from the data folder"""
+    texts = []
+    filenames = []
+    
+    txt_files = glob.glob(os.path.join(data_folder, "*.txt"))
+    print(f"Found {len(txt_files)} text files")
+    
+    if len(txt_files) == 0:
+        print(f"No .txt files found in {data_folder} folder!")
+        return filenames, texts
+    
+    for file_path in txt_files:
+        try:
+            with open(file_path, 'r', encoding='utf-8') as file:
+                content = file.read()
+                texts.append(content)
+                filenames.append(os.path.basename(file_path))
+                print(f"✅ Loaded: {os.path.basename(file_path)} ({len(content)} characters)")
+        except Exception as e:
+            print(f"❌ Error loading {file_path}: {e}")
+    
+    return filenames, texts
+
+# ============================================
+# STEP 2: SMART DOCUMENT CHUNKING
+# ============================================
+def chunk_document(text, tokenizer, max_tokens=MAX_INPUT_TOKENS, overlap=CHUNK_OVERLAP):
+    """Intelligently chunk a long document into overlapping segments"""
+    tokens = tokenizer.encode(text)
+    
+    if len(tokens) <= max_tokens:
+        return [text]
+    
+    chunks = []
+    start = 0
+    
+    while start < len(tokens):
+        end = min(start + max_tokens, len(tokens))
+        chunk_tokens = tokens[start:end]
+        chunk_text = tokenizer.decode(chunk_tokens, skip_special_tokens=True)
+        chunks.append(chunk_text)
+        start += max_tokens - overlap
+    
+    print(f"   Split into {len(chunks)} chunks")
+    return chunks
+
+# ============================================
+# STEP 3: SUMMARIZE WITH LED MODEL
+# ============================================
+def summarize_documents(texts, max_summary_length=200, min_summary_length=80):
+    """Generate summaries using LED model for very long documents"""
+    print("\n📝 Initializing LED summarization pipeline...")
+    print(f"   Model: {SUMMARIZATION_MODEL}")
+    print(f"   🔗 {SUMMARIZATION_MODEL_LINK}")
+    print(f"   Max input tokens: {MAX_INPUT_TOKENS} (handles VERY long documents!)")
+    
+    device = 0 if torch.cuda.is_available() else -1
+    print(f"   Using device: {'GPU' if device == 0 else 'CPU'}")
+    
+    try:
+        print("   Loading tokenizer...")
+        tokenizer = AutoTokenizer.from_pretrained("allenai/led-base-16384")
+        
+        print("   Loading LED model...")
+        model = AutoModelForSeq2SeqLM.from_pretrained(SUMMARIZATION_MODEL)
+        
+        if device == 0:
+            model = model.cuda()
+        
+        summaries = []
+        
+        for i, text in enumerate(texts):
+            print(f"\n   📄 Document {i+1}/{len(texts)}")
+            
+            try:
+                chunks = chunk_document(text, tokenizer)
+                
+                if len(chunks) == 1:
+                    print(f"   Processing as single chunk ({len(text)} chars)")
+                    
+                    inputs = tokenizer.encode(
+                        "summarize: " + text,
+                        return_tensors="pt",
+                        max_length=MAX_INPUT_TOKENS,
+                        truncation=True
+                    )
+                    
+                    if device == 0:
+                        inputs = inputs.cuda()
+                    
+                    global_attention_mask = torch.zeros_like(inputs)
+                    global_attention_mask[:, 0] = 1
+                    
+                    summary_ids = model.generate(
+                        inputs,
+                        global_attention_mask=global_attention_mask,
+                        max_length=max_summary_length,
+                        min_length=min_summary_length,
+                        num_beams=4,
+                        early_stopping=True,
+                        no_repeat_ngram_size=3,
+                        repetition_penalty=3.5
+                    )
+                    
+                    summary = tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+                    summaries.append(summary)
+                    print(f"     ✅ Summary generated ({len(summary)} chars)")
+                    
+                else:
+                    print(f"   Processing {len(chunks)} chunks...")
+                    chunk_summaries = []
+                    
+                    for j, chunk in enumerate(chunks):
+                        print(f"     Chunk {j+1}/{len(chunks)}...")
+                        
+                        inputs = tokenizer.encode(
+                            "summarize: " + chunk,
+                            return_tensors="pt",
+                            max_length=MAX_INPUT_TOKENS,
+                            truncation=True
+                        )
+                        
+                        if device == 0:
+                            inputs = inputs.cuda()
+                        
+                        global_attention_mask = torch.zeros_like(inputs)
+                        global_attention_mask[:, 0] = 1
+                        
+                        chunk_ids = model.generate(
+                            inputs,
+                            global_attention_mask=global_attention_mask,
+                            max_length=150,
+                            min_length=50,
+                            num_beams=4,
+                            early_stopping=True
+                        )
+                        
+                        chunk_summary = tokenizer.decode(chunk_ids[0], skip_special_tokens=True)
+                        chunk_summaries.append(chunk_summary)
+                    
+                    combined = " ".join(chunk_summaries)
+                    
+                    if len(combined) > 2000:
+                        inputs = tokenizer.encode(
+                            "summarize: " + combined,
+                            return_tensors="pt",
+                            max_length=MAX_INPUT_TOKENS,
+                            truncation=True
+                        )
+                        
+                        if device == 0:
+                            inputs = inputs.cuda()
+                        
+                        global_attention_mask = torch.zeros_like(inputs)
+                        global_attention_mask[:, 0] = 1
+                        
+                        final_ids = model.generate(
+                            inputs,
+                            global_attention_mask=global_attention_mask,
+                            max_length=max_summary_length,
+                            min_length=min_summary_length,
+                            num_beams=4,
+                            early_stopping=True
+                        )
+                        
+                        final_summary = tokenizer.decode(final_ids[0], skip_special_tokens=True)
+                        summaries.append(final_summary)
+                        print(f"     ✅ Final summary ({len(final_summary)} chars)")
+                    else:
+                        summaries.append(combined)
+                        print(f"     ✅ Combined summary ({len(combined)} chars)")
+                
+            except Exception as e:
+                print(f"     ❌ Error: {e}")
+                if len(text) > 2000:
+                    mid_point = len(text) // 2
+                    summaries.append(text[mid_point:mid_point+1000] + "...")
+                else:
+                    summaries.append(text[:500] + "...")
+        
+        return summaries
+        
+    except Exception as e:
+        print(f"❌ Critical error: {e}")
+        summaries = []
+        for text in texts:
+            paragraphs = text.split('\n\n')
+            start_idx = max(1, int(len(paragraphs) * 0.2))
+            end_idx = int(len(paragraphs) * 0.8)
+            middle_paragraphs = paragraphs[start_idx:end_idx]
+            
+            if middle_paragraphs:
+                summaries.append('\n\n'.join(middle_paragraphs)[:1500])
+            else:
+                summaries.append(text[:1000])
+        
+        return summaries
+
+# ============================================
+# STEP 4: GENERATE EMBEDDINGS
+# ============================================
+def generate_embeddings(texts):
+    """Generate embeddings using sentence transformers"""
+    print(f"\n🔤 Loading embedding model...")
+    print(f"   Model: {EMBEDDING_MODEL}")
+    print(f"   🔗 {EMBEDDING_MODEL_LINK}")
+    
+    try:
+        model = SentenceTransformer(EMBEDDING_MODEL)
+        print("   ✅ Model loaded")
+        
+        print("   Generating embeddings...")
+        embeddings = model.encode(texts, show_progress_bar=True)
+        print(f"   ✅ Embeddings: {embeddings.shape}")
+        
+        return embeddings
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        return None
+
+# ============================================
+# STEP 5: FIND OPTIMAL CLUSTERS (K-MEANS)
+# ============================================
+def find_optimal_clusters(embeddings, max_clusters=10):
+    """Find optimal number of clusters using silhouette score"""
+    if embeddings is None or len(embeddings) < 2:
+        return 2
+    
+    silhouette_scores = []
+    k_range = range(2, min(max_clusters + 1, len(embeddings)))
+    
+    print(f"\n📊 Finding optimal number of clusters...")
+    
+    for n_clusters in k_range:
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        labels = kmeans.fit_predict(embeddings)
+        score = silhouette_score(embeddings, labels)
+        silhouette_scores.append(score)
+        print(f"   {n_clusters} clusters: {score:.3f}")
+    
+    # Plot silhouette scores
+    plt.figure(figsize=(10, 6))
+    plt.plot(k_range, silhouette_scores, marker='o', linewidth=2, markersize=8)
+    plt.xlabel('Number of clusters', fontsize=12)
+    plt.ylabel('Silhouette Score', fontsize=12)
+    plt.title('Optimal Number of Clusters (K-means)', fontsize=14)
+    plt.grid(True, alpha=0.3)
+    plt.savefig('kmeans_optimal_clusters.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    
+    optimal = k_range[np.argmax(silhouette_scores)]
+    print(f"\n✅ Optimal number of clusters: {optimal}")
+    return optimal
+
+# ============================================
+# STEP 6: PERFORM K-MEANS CLUSTERING
+# ============================================
+def perform_kmeans(embeddings, n_clusters, filenames):
+    """Perform K-means clustering and visualize results"""
+    print(f"\n🔮 Performing K-means clustering with {n_clusters} clusters...")
+    
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    cluster_labels = kmeans.fit_predict(embeddings)
+    
+    # t-SNE visualization
+    print("   Creating t-SNE visualization...")
+    perplexity = min(30, len(embeddings)-1)
+    tsne = TSNE(n_components=2, random_state=42, perplexity=perplexity)
+    embeddings_2d = tsne.fit_transform(embeddings)
+    
+    plt.figure(figsize=(14, 10))
+    scatter = plt.scatter(embeddings_2d[:, 0], embeddings_2d[:, 1], 
+                         c=cluster_labels, cmap='viridis', s=200, alpha=0.7)
+    
+    for i, filename in enumerate(filenames):
+        display_name = filename.replace('.txt', '')[:20]
+        if len(filename) > 20:
+            display_name += '...'
+        plt.annotate(display_name, 
+                    (embeddings_2d[i, 0], embeddings_2d[i, 1]),
+                    fontsize=8, alpha=0.8, 
+                    xytext=(5, 5), textcoords='offset points')
+    
+    plt.colorbar(scatter, label='Cluster')
+    plt.title(f'ESG Document Clusters (K-means)\n{n_clusters} clusters, {len(filenames)} documents', 
+              fontsize=14, fontweight='bold')
+    plt.xlabel('t-SNE Component 1')
+    plt.ylabel('t-SNE Component 2')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('kmeans_clusters_visualization.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    return cluster_labels
+
+# ============================================
+# STEP 7: ANALYZE AND SAVE RESULTS
+# ============================================
+def analyze_results(filenames, cluster_labels, summaries=None):
+    """Print analysis and save results"""
+    df_results = pd.DataFrame({
+        'filename': filenames,
+        'cluster': cluster_labels
+    })
+    
+    print("\n" + "="*60)
+    print("📊 CLUSTER ANALYSIS (K-means)")
+    print("="*60)
+    
+    for cluster_id in sorted(df_results['cluster'].unique()):
+        cluster_files = df_results[df_results['cluster'] == cluster_id]['filename'].tolist()
+        print(f"\n🔵 Cluster {cluster_id} ({len(cluster_files)} documents):")
+        for i, file in enumerate(cluster_files, 1):
+            print(f"   {i}. {file}")
+    
+    # Save results
+    df_results.to_csv('kmeans_clustering_results.csv', index=False)
+    print(f"\n💾 Results saved to 'kmeans_clustering_results.csv'")
+    
+    # Save summaries with clusters
+    if summaries:
+        summary_df = pd.DataFrame({
+            'filename': filenames,
+            'summary': summaries,
+            'cluster': cluster_labels
+        })
+        summary_df.to_csv('document_summaries_with_clusters.csv', index=False)
+        print(f"💾 Summaries saved to 'document_summaries_with_clusters.csv'")
+    
+    return df_results
+
+# ============================================
+# MAIN EXECUTION
+# ============================================
+def main():
+    print("="*60)
+    print("🌍 ESG REPORT CLUSTERING WITH LED + K-MEANS")
+    print("   Long Document Summarization + K-means Clustering")
+    print("="*60)
+    print("\n📌 Models used:")
+    print(f"   1. Summarization: {SUMMARIZATION_MODEL}")
+    print(f"      🔗 {SUMMARIZATION_MODEL_LINK}")
+    print(f"   2. Embeddings: {EMBEDDING_MODEL}")
+    print(f"      🔗 {EMBEDDING_MODEL_LINK}")
+    print(f"   Context Window: {MAX_INPUT_TOKENS} tokens (handles 50+ page documents!)")
+    print("="*60)
+    
+    # Load documents
+    filenames, texts = load_text_files("data")
+    
+    if not texts:
+        print("\n❌ No text files found!")
+        return
+    
+    print(f"\n📄 Loaded {len(texts)} documents")
+    
+    # Summarize with LED
+    print("\n" + "="*60)
+    print(" STEP 1: SUMMARIZING WITH LED")
+    print("="*60)
+    summaries = summarize_documents(texts, max_summary_length=200, min_summary_length=80)
+    
+    # Generate embeddings
+    print("\n" + "="*60)
+    print(" STEP 2: GENERATING EMBEDDINGS")
+    print("="*60)
+    embeddings = generate_embeddings(summaries)
+    
+    if embeddings is None:
+        return
+    
+    # Find optimal clusters
+    print("\n" + "="*60)
+    print(" STEP 3: FINDING OPTIMAL K")
+    print("="*60)
+    optimal_k = find_optimal_clusters(embeddings)
+    
+    # Perform K-means
+    print("\n" + "="*60)
+    print(" STEP 4: K-MEANS CLUSTERING")
+    print("="*60)
+    cluster_labels = perform_kmeans(embeddings, optimal_k, filenames)
+    
+    # Analyze results
+    print("\n" + "="*60)
+    print(" STEP 5: ANALYZING RESULTS")
+    print("="*60)
+    df_results = analyze_results(filenames, cluster_labels, summaries)
+    
+    print("\n" + "="*60)
+    print("✅ PIPELINE COMPLETE")
+    print("="*60)
+    print("\n📁 Files created:")
+    print("   - kmeans_optimal_clusters.png (silhouette score plot)")
+    print("   - kmeans_clusters_visualization.png (t-SNE visualization)")
+    print("   - kmeans_clustering_results.csv (cluster assignments)")
+    print("   - document_summaries_with_clusters.csv (summaries + clusters)")
+    print("\n📊 Quick cluster summary:")
+    print(df_results['cluster'].value_counts().sort_index())
+    print("\n" + "="*60)
+
+if __name__ == "__main__":
+    main()
